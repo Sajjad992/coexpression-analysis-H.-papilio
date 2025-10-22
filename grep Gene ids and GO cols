@@ -1,0 +1,25 @@
+Here, we aim to retrieve Gene IDs and eggNOG_GO columns from the Trinotate file. Then, we will add descriptions for these columns for GO enrichment of modules of interest after co-expression.
+
+“# Extract gene ID and GO column (column 24), keep header
+awk -F'\t' 'BEGIN {OFS="\t"} NR==1 || $0 !~ /^#/ {print $1, $24}' Hippeastrum_papilio_trinotate4.tsv > Gene_GO_list.tsv
+
+# Filter out empty or missing GO entries
+awk -F'\t' 'NR>1 && $2 != "." && $2 != "" {print $1"\t"$2}' Gene_GO_list.tsv > Hippeastrum_GO_filtered.tsv
+
+# Split multiple GO terms separated by comma into long format
+awk -F'\t' '{
+  n = split($2, arr, ",");
+  for (i = 1; i <= n; i++) print $1"\t"arr[i];
+}' Hippeastrum_GO_filtered.tsv > Hippeastrum_GO_long.tsv
+
+# Optional: count total lines
+wc -l Hippeastrum_GO_long.tsv
+
+# Optional: count unique GO terms
+awk '{print $2}' Hippeastrum_GO_long.tsv | sort | uniq | wc -l”
+# Create a temporary mapping of GO -> description
+awk -F'\t' 'NR>1 {desc[$2]=$3} END {for (id in desc) print id, desc[id]}' OFS='\t' trinotate_GO_desc_long.tsv > GO_desc_map.tsv
+
+# Add description to your long GO file
+awk -F'\t' 'NR==FNR {desc[$1]=$2; next} {print $1, $2, desc[$2]}' OFS='\t' GO_desc_map.tsv Hippeastrum_GO_long.tsv > Hippeastrum_GO_long_with_desc.tsv
+
