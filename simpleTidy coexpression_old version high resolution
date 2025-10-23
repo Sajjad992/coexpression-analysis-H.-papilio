@@ -295,4 +295,4 @@ wrap_plots(module_heatmap, module_heatmap_nGenes, ncol = 2, widths = c(2, 0.1))
 ggsave("plots/GeneCoex_FDR_filtereddoubtnew.svg", height = 9, width = 12, bg = "white")
 ggsave("plots/GeneCoex_FDR_filtereddoubtnew.png", height = 9, width = 12, bg = "white", dpi = 1200)
 
-DR_filtereddoubtnew.png", height = 9, width = 12, bg = "white", dpi = 1200)
+
