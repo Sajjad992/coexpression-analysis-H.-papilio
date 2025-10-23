@@ -1,0 +1,298 @@
+============================================================
+1️⃣ Load Packages and Source Functions
+============================================================
+
+source("scripts/FUNCTIONS.R") # loads packages too
+library(tidyverse)
+
+============================================================
+2️⃣ Load Expression Tables
+============================================================
+
+files <- list.files(
+pattern = "Exp_table_long_averaged_z_\d+\.tsv$",
+full.names = TRUE
+)
+
+Exp_table_long_averaged_z <- files %>%
+map(~ read_delim(.x, delim = "\t", show_col_types = FALSE)) %>%
+bind_rows()
+
+============================================================
+3️⃣ Metadata
+============================================================
+
+metadata <- read_delim(
+"metadata.txt",
+col_names = c("replicateName", "tissue", rep(".", 3))
+) %>%
+filter(replicateName %in% names(Exp_table)) %>%
+select(replicateName, tissue) %>%
+mutate(SampleName = tissue)
+
+============================================================
+4️⃣ Bait Gene Preparation
+============================================================
+
+Baits <- read_delim("baitall.txt", delim = "\t", col_names = TRUE) %>%
+mutate(gene_ID = sub("_i\d+$", "", Transcript ID)) %>% # remove isoform suffix
+select(gene_ID, Gene_name = Gene)
+
+write_delim(Baits, "bait_genes_clean.tsv", delim = "\t")
+head(Baits)
+
+============================================================
+5️⃣ Clean Tissue Names and Define Order
+============================================================
+
+metadata <- metadata %>%
+mutate(tissue = gsub("_|\s+", "", tissue))
+
+tissue_order <- c(
+"Root", "Basalplate", "Innerbulb", "Youngleaf", "Oldleaf",
+"Flowerstalk", "Petal", "Peduncle", "Pistil"
+)
+
+metadata <- metadata %>%
+mutate(TissueOrdered = factor(tissue, levels = tissue_order))
+
+============================================================
+6️⃣ Prepare z-score Matrix
+============================================================
+
+z_score_wide <- Exp_table_long_averaged_z %>%
+mutate(tissue = SampleName) %>%
+select(gene_ID, tissue, z.score.TPM) %>%
+pivot_wider(names_from = tissue, values_from = z.score.TPM) %>%
+as.data.frame()
+
+nreps <- ncol(z_score_wide) - 1
+
+============================================================
+7️⃣ Correlation Against Baits
+============================================================
+
+correlation_against_baits <- sapply(Baits$gene_ID, simplify = FALSE, (x) {
+dBait <- (z_score_wide %>% filter(gene_ID == x))[-1] %>% as.matrix() %>% t()
+dOthers <- (z_score_wide %>% filter(gene_ID != x))[-1] %>% as.matrix() %>% t()
+
+data.frame(correlation = cor(dBait, dOthers) %>% t()) %>%
+mutate(
+Gene1 = x,
+Gene2 = (z_score_wide %>% filter(gene_ID != x))$gene_ID,
+r2 = correlation^2,
+t = correlation * sqrt((nreps - 2) / (1 - r2)),
+p.value = case_when(
+t > 0 ~ pt(t, df = nreps - 2, lower.tail = FALSE),
+TRUE ~ pt(t, df = nreps - 2, lower.tail = TRUE)
+),
+FDR = p.adjust(p.value, method = "fdr"),
+significant = ifelse(FDR < 0.01, TRUE, FALSE)
+)
+}) %>% list_rbind()
+
+============================================================
+8️⃣ Correlation Distribution Plot
+============================================================
+
+correlation_against_baits %>%
+ggplot() +
+geom_histogram(aes(x = correlation), fill = "black", bins = 100) +
+geom_vline(xintercept = 0.9, color = "red", linewidth = 0.85) +
+labs(
+title = "Gene correlations - Bait genes",
+x = "Number of correlations"
+) +
+scale_x_continuous(breaks = seq(-1, 1, 0.4)) +
+theme_classic() +
+theme(
+text = element_text(size = 14),
+axis.text = element_text(color = "black")
+)
+
+============================================================
+9️⃣ Filter Correlations
+============================================================
+
+r_cutoff <- 0.9
+edge_table <- correlation_against_baits %>%
+filter(correlation > r_cutoff, significant) %>%
+rename(from = Gene1, to = Gene2) %>%
+relocate(from, to, .before = everything())
+
+============================================================
+🔟 All-vs-All Correlations
+============================================================
+
+r_cutoff <- 0.9
+genes_to_keep <- correlation_against_baits %>%
+filter(correlation > r_cutoff, significant) %>%
+distinct(Gene2) %>%
+pull(Gene2) %>%
+union(unique(correlation_against_baits$Gene1))
+
+Expr_filtered_long <- Exp_table_long_averaged_z %>%
+filter(gene_ID %in% genes_to_keep)
+
+Expr_filtered_wide <- Expr_filtered_long %>%
+select(gene_ID, tissue, z.score.TPM) %>%
+pivot_wider(names_from = tissue, values_from = z.score.TPM) %>%
+column_to_rownames("gene_ID")
+
+cor_mat <- cor(t(Expr_filtered_wide), method = "pearson", use = "pairwise.complete.obs")
+
+cor_long <- as.data.frame(cor_mat) %>%
+rownames_to_column("Gene1") %>%
+pivot_longer(-Gene1, names_to = "Gene2", values_to = "correlation") %>%
+filter(Gene1 != Gene2)
+
+cor_long_filtered <- cor_long %>%
+filter(abs(correlation) > r_cutoff)
+
+write_tsv(cor_long_filtered, "GeneCoexpression_all_vs_all_filteredn.tsv")
+
+============================================================
+11️⃣ Keep Only Bait-Connected Genes
+============================================================
+
+Baits <- read.delim("bait_genes_clean.tsv", stringsAsFactors = FALSE)
+bait_genes <- Baits$gene_ID
+
+bait_edges <- cor_long_filtered %>%
+filter(Gene1 %in% bait_genes | Gene2 %in% bait_genes)
+
+connected_genes <- unique(c(bait_edges$Gene1, bait_edges$Gene2))
+
+cor_long_final <- cor_long_filtered %>%
+filter(Gene1 %in% connected_genes, Gene2 %in% connected_genes)
+
+============================================================
+12️⃣ Compute p-value, FDR
+============================================================
+
+n_samples <- 9
+cor_long_filtered <- cor_long_filtered %>%
+mutate(
+t_stat = correlation * sqrt((n_samples - 2) / (1 - correlation^2)),
+p_value = 2 * pt(-abs(t_stat), df = n_samples - 2),
+FDR = p.adjust(p_value, method = "BH")
+)
+
+cor_long_significant <- cor_long_filtered %>%
+filter(FDR < 0.05, correlation > 0.9)
+
+============================================================
+13️⃣ Build Network
+============================================================
+
+edge_table <- cor_long_significant %>%
+rename(from = Gene1, to = Gene2, weight = correlation)
+
+node_table <- data.frame(gene_ID = unique(c(edge_table$from, edge_table$to)))
+
+my_network <- graph_from_data_frame(edge_table, vertices = node_table, directed = FALSE)
+
+cat("Network summary:\n Nodes:", vcount(my_network), "\n Edges:", ecount(my_network), "\n")
+
+============================================================
+14️⃣ Leiden Community Detection
+============================================================
+
+minGenes <- 5
+future::plan(multisession, workers = 1)
+
+optimization_results <- future_map(
+.x = seq(0.25, 5, by = 0.25),
+.options = furrr_options(seed = TRUE),
+~ optimize_resolution(network = my_network, resolution = .x, minGenes = minGenes)
+) %>%
+lapply((x) data.frame(num_module = x[1], num_contained_gene = x[2])) %>%
+list_rbind() %>%
+mutate(resolution = seq(0.25, 5, by = 0.25))
+
+ngenes_threshold <- max(optimization_results$num_contained_gene)
+resolution <- (optimization_results %>%
+filter(num_contained_gene >= ngenes_threshold))$resolution %>%
+max()
+
+modules_ <- cluster_leiden(
+my_network,
+resolution = resolution,
+objective_function = "modularity"
+)
+
+my_network_modules <- data.frame(
+gene_ID = names(membership(modules_)),
+module = as.vector(membership(modules_))
+) %>%
+inner_join(node_table, by = "gene_ID") %>%
+group_by(module) %>%
+filter(n() >= minGenes) %>%
+ungroup()
+
+cat("Modules detected:", length(unique(my_network_modules$module)), "\n")
+
+============================================================
+15️⃣ Mean z-score per Module
+============================================================
+
+Expr_averaged_z_high_var_modules <- Exp_table_long_averaged_z %>%
+inner_join(my_network_modules, by = "gene_ID") %>%
+mutate(tissue = gsub("_|\s+", "", tissue))
+
+modules_mean_z <- Expr_averaged_z_high_var_modules %>%
+group_by(module, tissue) %>%
+summarise(mean.z = mean(z.score.TPM), .groups = "drop")
+
+metadata <- metadata %>%
+mutate(tissue = gsub("_|\s+", "", tissue))
+
+heatmap_data <- modules_mean_z %>%
+left_join(metadata[, c("TissueOrdered", "tissue")], by = "tissue")
+
+genes_per_module <- Expr_averaged_z_high_var_modules %>%
+group_by(module) %>%
+summarise(n = n_distinct(gene_ID), .groups = "drop")
+
+heatmap_data <- full_join(heatmap_data, genes_per_module, by = "module") %>%
+arrange(desc(n)) %>%
+mutate(ordered_modules = factor(module, levels = unique(module)))
+
+============================================================
+16️⃣ Heatmap Visualization
+============================================================
+##rotate
+module_heatmap <- heatmap_data %>%
+  ggplot(aes(x = TissueOrdered, y = ordered_modules)) +
+  geom_tile(aes(fill = mean.z), color = "grey80") +
+  scale_fill_gradient2(
+    mid = "white", high = "#67001F", low = "#053061",
+    breaks = c(-1.5, 0, 1.5), labels = c("< -1.5", "0", "> 1.5")
+  ) +
+  labs(
+    x = "Tissue", y = "Module", fill = "z-score",
+    caption = paste0("r ≥ ", r_cutoff, ", FDR < 0.05, resolution = ", resolution)
+  ) +
+  heatmap_theme +
+  theme(
+    axis.text.x = element_text(angle = -45, hjust = 0, vjust = 1)  # <-- rotate tissue labels
+  )
+module_heatmap_nGenes <- heatmap_data %>%
+  select(ordered_modules, n) %>%
+  unique() %>%
+  ggplot(aes(y = ordered_modules, x = "", label = n)) +
+  geom_tile(fill = "white", color = "white") +
+  geom_text() +
+  scale_x_discrete(position = "top") +  # move x-axis to top
+  labs(x = "Genes\nin\nmodule") +
+  annotation_theme +
+  theme(
+    axis.title.x.top = element_text(hjust = 1, vjust = 0.5)  # top-right alignment
+  )
+
+wrap_plots(module_heatmap, module_heatmap_nGenes, ncol = 2, widths = c(2, 0.1))
+
+ggsave("plots/GeneCoex_FDR_filtereddoubtnew.svg", height = 9, width = 12, bg = "white")
+ggsave("plots/GeneCoex_FDR_filtereddoubtnew.png", height = 9, width = 12, bg = "white", dpi = 1200)
+
+DR_filtereddoubtnew.png", height = 9, width = 12, bg = "white", dpi = 1200)
