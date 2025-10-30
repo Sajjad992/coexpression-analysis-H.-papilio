@@ -82,11 +82,15 @@ correlation_against_baits <- sapply(Baits$gene_ID, simplify = FALSE, \(x) {
     mutate(Gene1 = x,
            Gene2 = filter(z_score_wide, gene_ID != x)$gene_ID,
            r2 = correlation^2,
-           t = correlation * sqrt((nreps - 2) / (1 - r2)),
-           p.value = 2 * pt(-abs(t), df = nreps - 2),
-           FDR = p.adjust(p.value, "fdr"),
-           significant = FDR < 0.01)
+           t_vals = ifelse(abs(correlation) == 1, Inf, correlation * sqrt(nreps - 2) / sqrt(1 - r2)),
+           p_vals = ifelse(abs(correlation) == 1, 0, pt(-abs(t_vals), df = nreps - 2))
+    )
 }) %>% list_rbind()
+
+correlation_againts_baits$fdr_vals <-  p.adjust(correlation_against_baits$p_vals, method = "fdr")
+correlation_againts_baits <-
+ correlation_againts_baits %>%
+  mutate(significant = fdr_vals < 0.05)
 
 # -------------------------------
 # 4️⃣ Visualize correlation distribution
@@ -148,19 +152,19 @@ if (!exists("n_samples") || is.null(n_samples)) {
 
 cor_long <- cor_long %>%
   mutate(
-    t_stat = ifelse(abs(correlation) == 1,
-                    Inf,
-                    correlation * sqrt((n_samples - 2) / (1 - correlation^2))),
-    p_value = ifelse(abs(correlation) == 1,
-                     0,
-                     2 * pt(-abs(t_stat), df = n_samples - 2)),
-    FDR = p.adjust(p_value, method = "BH")
+    t_stat = ifelse(abs(correlation) == 1, Inf, correlation * sqrt((n_samples - 2) / (1 - correlation^2))),
+    p_value = ifelse(abs(correlation) == 1, 0, 2 * pt(-abs(t_stat), df = n_samples - 2))
   )
+}) %>% list_rbind()
+
+cor_long$FDR <-  p.adjust(cor_long$p_value, method = "fdr")
+cor_long <-
+ cor_long %>%
+  mutate(significant = FDR < 0.05)
 
 # Then filter normally
 cor_long_filtered <- cor_long %>%
   filter(FDR < 0.05, abs(correlation) >= r_cutoff)
-
 
 # remove mirror duplicates (A_B and B_A) keeping one
 cor_long_filtered_unique <- cor_long_filtered %>%
