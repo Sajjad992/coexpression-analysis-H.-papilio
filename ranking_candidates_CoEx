@@ -1,0 +1,577 @@
+library(tidyverse)
+library(readr)
+library(dplyr)
+
+# ---------------------------------------------------------
+# 1) Load Trinotate annotation
+# ---------------------------------------------------------
+trinotate <- read_delim(
+  "annotations/Hpprotein_encoding_trinotate4.tsv",
+  delim = "\t",
+  show_col_types = FALSE
+) %>%
+  select(-any_of(c("sprot_Top_BLASTX_hit", "infernal")))
+
+colnames(trinotate)
+
+# ---------------------------------------------------------
+# 2) Load NEW branch-guided annotated modules
+# ---------------------------------------------------------
+genes_modules <- read_delim(
+  "branch_guided_coexpression/results/branch_guided_network_modules_annotated.tsv",
+  delim = "\t",
+  show_col_types = FALSE
+)
+
+colnames(genes_modules)
+head(genes_modules)
+
+# ---------------------------------------------------------
+# 3) Join module info with annotation
+# ---------------------------------------------------------
+annotation_branch_guided <- genes_modules %>%
+  left_join(trinotate, by = c("gene_ID" = "#gene_id"))
+
+colnames(annotation_branch_guided)
+
+# ---------------------------------------------------------
+# 4) Quick checks
+# ---------------------------------------------------------
+cat("Rows in genes_modules:", nrow(genes_modules), "\n")
+cat("Rows in annotation_branch_guided:", nrow(annotation_branch_guided), "\n")
+cat("Unique genes in genes_modules:", n_distinct(genes_modules$gene_ID), "\n")
+cat("Unique genes after join:", n_distinct(annotation_branch_guided$gene_ID), "\n")
+
+# ---------------------------------------------------------
+# 5) Define biologically relevant module groups
+#    Based on your module heatmap interpretation
+# ---------------------------------------------------------
+gal_modules      <- c(2, 4)  # galanthamine-like
+shared_modules   <- c(1)     # high total AA / Peduncle
+bioactive_modules <- c(5)    # biosynthetically active / Innerbulb
+
+# ---------------------------------------------------------
+# 6) Subset annotated genes by module group
+# ---------------------------------------------------------
+annotation_gal_modules <- annotation_branch_guided %>%
+  filter(module %in% gal_modules)
+
+annotation_shared_modules <- annotation_branch_guided %>%
+  filter(module %in% shared_modules)
+
+annotation_bioactive_modules <- annotation_branch_guided %>%
+  filter(module %in% bioactive_modules)
+
+# ---------------------------------------------------------
+# 7) Check gene counts
+# ---------------------------------------------------------
+cat("\nAnnotated galanthamine-module genes:", nrow(annotation_gal_modules), "\n")
+cat("Unique galanthamine-module genes:", n_distinct(annotation_gal_modules$gene_ID), "\n")
+
+cat("\nAnnotated shared-module genes:", nrow(annotation_shared_modules), "\n")
+cat("Unique shared-module genes:", n_distinct(annotation_shared_modules$gene_ID), "\n")
+
+cat("\nAnnotated biosynthetic-active genes:", nrow(annotation_bioactive_modules), "\n")
+cat("Unique biosynthetic-active genes:", n_distinct(annotation_bioactive_modules$gene_ID), "\n")
+
+# ---------------------------------------------------------
+# 8) Save annotated tables
+# ---------------------------------------------------------
+write_tsv(
+  annotation_branch_guided,
+  "branch_guided_coexpression/tables/annotation_branch_guided_all_modules.tsv"
+)
+
+write_tsv(
+  annotation_gal_modules,
+  "branch_guided_coexpression/tables/annotation_branch_guided_galanthamine_modules_2_4.tsv"
+)
+
+write_tsv(
+  annotation_shared_modules,
+  "branch_guided_coexpression/tables/annotation_branch_guided_shared_module_1.tsv"
+)
+
+write_tsv(
+  annotation_bioactive_modules,
+  "branch_guided_coexpression/tables/annotation_branch_guided_biosynth_active_module_5.tsv"
+)
+
+# Optional CSV versions
+write_csv(
+  annotation_branch_guided,
+  "branch_guided_coexpression/tables/annotation_branch_guided_all_modules.csv"
+)
+
+write_csv(
+  annotation_gal_modules,
+  "branch_guided_coexpression/tables/annotation_branch_guided_galanthamine_modules_2_4.csv"
+)
+
+write_csv(
+  annotation_shared_modules,
+  "branch_guided_coexpression/tables/annotation_branch_guided_shared_module_1.csv"
+)
+
+write_csv(
+  annotation_bioactive_modules,
+  "branch_guided_coexpression/tables/annotation_branch_guided_biosynth_active_module_5.csv"
+)
+
+# ---------------------------------------------------------
+# 9) Clean Pfam table from Trinotate
+# ---------------------------------------------------------
+# ================================================================
+# Branch-guided candidate ranking — complete corrected script
+# ================================================================
+
+library(tidyverse)
+colnames(trinotate)
+
+# ----------------------------------------------------------------
+# 1) Pfam description lookup from Trinotate
+#    Handles both backtick and caret delimiters
+# ----------------------------------------------------------------
+pfam_description_lookup <- trinotate %>%
+  select(gene_id = `#gene_id`, Pfam) %>%
+  filter(!is.na(Pfam), Pfam != ".") %>%
+  separate_rows(Pfam, sep = "`") %>%
+  mutate(
+    Pfam_ID   = str_extract(Pfam, "PF\\d+"),
+    Pfam_desc = str_extract(Pfam, "(?<=[`\\^])[^`\\^]+(?=[`\\^])")
+  ) %>%
+  filter(!is.na(Pfam_ID)) %>%
+  distinct(gene_id, Pfam_ID, Pfam_desc)
+
+# Collapse to one row per gene
+pfam_per_gene <- pfam_description_lookup %>%
+  group_by(gene_id) %>%
+  summarise(
+    Pfam_IDs  = paste(unique(Pfam_ID),   collapse = ";"),
+    Pfam_desc = paste(unique(na.omit(Pfam_desc)), collapse = ";"),
+    .groups = "drop"
+  )
+
+cat("Genes with Pfam annotation:", nrow(pfam_per_gene), "\n")
+
+# ----------------------------------------------------------------
+# 2) Build candidate base table
+#    Exclude known baits, keep modules of interest
+# ----------------------------------------------------------------
+new_candidates <- my_network_modules_annotated %>%
+  filter(module %in% c(1, 2, 4, 5)) %>%
+  filter(!gene_ID %in% bait_info$gene_ID)
+
+cat("New candidates (non-bait, modules 1/2/4/5):", nrow(new_candidates), "\n")
+colnames(new_candidates)
+# ----------------------------------------------------------------
+# 3) Join Pfam + Trinotate annotation
+#    Clean up any duplicate columns from prior joins
+# ----------------------------------------------------------------
+# ----------------------------------------------------------------
+# 3) Join Pfam + Trinotate annotation — CORRECTED
+# add peptide, transcript, prot_coords to existing join
+# ----------------------------------------------------------------
+new_candidates_annot <- new_candidates %>%
+  select(-any_of(c("Pfam", "Pfam_IDs", "Pfam_desc",
+                   "module.y", "Module_class.y",
+                   "Gal_score.y", "Hae_score.y",
+                   "TotalAA_score.y", "Bio_score.y"))) %>%
+  rename_with(~str_remove(.x, "\\.x$")) %>%
+  left_join(pfam_per_gene, by = c("gene_ID" = "gene_id")) %>%
+  left_join(
+    trinotate %>%
+      select(gene_id = `#gene_id`,
+             EggNM.Description,
+             sprot_Top_BLASTP_hit,
+             gene_ontology_Pfam,
+             prot_coords,        # ← added
+             peptide,            # ← added
+             transcript          # ← added
+      ) %>%
+      mutate(
+        protein_length    = if_else(
+          !is.na(peptide) & peptide != ".",
+          nchar(peptide), NA_integer_),
+        transcript_length = if_else(
+          !is.na(transcript) & transcript != ".",
+          nchar(transcript), NA_integer_)
+      ) %>%
+      group_by(gene_id) %>%
+      slice_max(protein_length, n = 1,
+                with_ties = FALSE) %>%
+      ungroup() %>%
+      distinct(gene_id, .keep_all = TRUE),
+    by = c("gene_ID" = "gene_id")
+  )
+cat("Candidates after annotation join:", nrow(new_candidates_annot), "\n")
+cat("Unique candidates:", n_distinct(new_candidates_annot$gene_ID), "\n")
+##
+
+# Check what gene_branch_scores looks like
+colnames(gene_branch_scores)
+head(gene_branch_scores)
+
+##joining 
+new_candidates_annot <- new_candidates_annot %>%
+  left_join(gene_branch_scores, by = "gene_ID")
+
+# Confirm
+colnames(new_candidates_annot) %>% str_subset("mean_r|max_r|n_baits")
+
+
+# ----------------------------------------------------------------
+# 4) Semantic Pfam category patterns
+#    Broad regex on descriptions — catches all family variants
+# ----------------------------------------------------------------
+pat_biosynthetic <- regex(paste(
+  "methyltransfer", "cytochrome P450", "\\bCYP\\b",
+  "reductase", "oxidase", "oxidoreductase", "dehydrogenase",
+  "hydroxylase", "synthase", "synthetase", "lyase", "ligase",
+  "transferase", "acetylase", "acyltransfer",
+  "glucosyltransfer", "glycosyltransfer",
+  "carboxylase", "isomerase", "decarboxylase", "epimerase",
+  "monooxygenase", "dioxygenase", "peroxidase",
+  sep = "|"), ignore_case = TRUE)
+
+pat_transporter <- regex(paste(
+  "transport", "permease", "carrier", "channel", "efflux",
+  "importer", "exporter", "\\bABC\\b", "\\bMATE\\b", "\\bMFS\\b",
+  "\\bNPF\\b", "\\bSWEET\\b", "\\bPOT\\b", "\\bNRT\\b",
+  "major facilitator", "drug resistance",
+  sep = "|"), ignore_case = TRUE)
+
+pat_tf <- regex(paste(
+  "WRKY", "\\bMYB\\b", "bHLH", "\\bAP2\\b", "\\bERF\\b",
+  "\\bNAC\\b", "\\bGRAS\\b", "\\bMADS\\b", "\\bBZIP\\b",
+  "\\bLBD\\b", "\\bARF\\b", "homeodomain", "zinc finger",
+  "\\bC2H2\\b", "\\bDOF\\b", "\\bTCP\\b", "\\bGRF\\b",
+  "transcription factor", "transcriptional regul",
+  sep = "|"), ignore_case = TRUE)
+
+pat_regulatory <- regex(paste(
+  "kinase", "phosphatase", "ubiquitin", "protease",
+  "receptor", "signal", "response regul",
+  sep = "|"), ignore_case = TRUE)
+
+# ----------------------------------------------------------------
+# 5) Priority scoring
+# ----------------------------------------------------------------
+new_candidates_ranked <- new_candidates_annot %>%
+  mutate(
+    desc_combined = paste(
+      replace_na(Pfam_desc, ""),
+      replace_na(EggNM.Description, ""),
+      replace_na(sprot_Top_BLASTP_hit, ""),
+      sep = " "
+    ),
+    
+    is_biosynthetic = str_detect(desc_combined, pat_biosynthetic),
+    is_transporter  = str_detect(desc_combined, pat_transporter),
+    is_tf           = str_detect(desc_combined, pat_tf),
+    is_regulatory   = str_detect(desc_combined, pat_regulatory),
+    
+    across(starts_with("is_"), ~replace_na(.x, FALSE)),
+    
+    module_priority = case_when(
+      module %in% c(1, 5) ~ 3,
+      module %in% c(2, 4) ~ 2,
+      TRUE                ~ 1
+    ),
+    
+    class_priority = case_when(
+      Module_class == "High Total AA / shared"  ~ 3,
+      Module_class == "Biosynthetically active" ~ 3,
+      Module_class == "Galanthamine-like"        ~ 2,
+      Module_class == "Haemanthamine-like"       ~ 2,
+      TRUE                                       ~ 1
+    ),
+    
+    annotation_priority = case_when(
+      is_biosynthetic          ~ 3,
+      is_transporter | is_tf   ~ 2,
+      is_regulatory            ~ 1,
+      TRUE                     ~ 0
+    ),
+    
+    annotation_category = case_when(
+      is_biosynthetic   ~ "biosynthetic enzyme",
+      is_transporter    ~ "transporter",
+      is_tf             ~ "transcription factor",
+      is_regulatory     ~ "regulatory",
+      !is.na(Pfam_desc) ~ "other annotated",
+      TRUE              ~ "no Pfam"
+    ),
+    
+    across(starts_with("mean_r_"), ~replace_na(.x, 0)),
+    across(starts_with("max_r_"),  ~replace_na(.x, 0)),
+    across(starts_with("n_baits"), ~replace_na(.x, 0L)),
+    
+    final_priority = module_priority + class_priority + annotation_priority
+    
+  ) %>%                              # ← mutate ends here
+  
+  # ---- REPLACES the old distinct + arrange ----
+distinct(gene_ID, .keep_all = TRUE) %>%
+  mutate(
+    best_branch_r = pmax(mean_r_Galanthamine, mean_r_Haemanthamine, mean_r_Precursor, na.rm = TRUE),
+    
+    best_branch = case_when(
+      best_branch_r == mean_r_Galanthamine  ~ "Galanthamine",
+      best_branch_r == mean_r_Haemanthamine ~ "Haemanthamine",
+      best_branch_r == mean_r_Precursor     ~ "Precursor",
+      TRUE                                  ~ "none"
+    ),
+    
+    best_branch_n_baits = case_when(
+      best_branch == "Galanthamine"  ~ n_baits_Galanthamine,
+      best_branch == "Haemanthamine" ~ n_baits_Haemanthamine,
+      best_branch == "Precursor"     ~ n_baits_Precursor,
+      TRUE                           ~ 0L
+    )
+  ) %>%
+  arrange(
+    desc(final_priority),
+    desc(best_branch_r),
+    desc(best_branch_n_baits)
+  )
+# ----------------------------------------------------------------
+# 6) Audit — what did each category capture?
+# ----------------------------------------------------------------
+cat("\nAnnotation category breakdown:\n")
+print(count(new_candidates_ranked, annotation_category, sort = TRUE))
+
+cat("\nPriority score distribution:\n")
+print(count(new_candidates_ranked, final_priority, sort = TRUE))
+# Check for duplicates
+n_distinct(new_candidates_ranked$gene_ID)
+nrow(new_candidates_ranked)
+
+# If different, see which genes are duplicated
+new_candidates_ranked %>%
+  count(gene_ID, sort = TRUE) %>%
+  filter(n > 1)
+
+# Genes with Pfam but scored 0 — potential missed candidates
+missed <- new_candidates_ranked %>%
+  filter(annotation_priority == 0, !is.na(Pfam_desc), Pfam_desc != "") %>%
+  separate_rows(Pfam_desc, sep = ";") %>%
+  filter(Pfam_desc != "") %>%
+  count(Pfam_desc, sort = TRUE)
+
+cat("\nPfam families in annotated-but-unscored genes (check for missed families):\n")
+print(missed, n = 40)
+
+
+# ----------------------------------------------------------------
+# 7) Preview top candidates
+# ----------------------------------------------------------------
+new_candidates_ranked %>%
+  select(
+    gene_ID, module, Module_class,
+    best_branch, best_branch_r, best_branch_n_baits,
+    annotation_category, Pfam_desc,
+    EggNM.Description,
+    final_priority, module_priority, class_priority, annotation_priority,
+    mean_r_Galanthamine, mean_r_Haemanthamine, mean_r_Precursor,
+    n_baits_Galanthamine, n_baits_Haemanthamine, n_baits_Precursor,
+    Gal_score, Hae_score, TotalAA_score, Bio_score
+  ) %>%
+  head(30) %>%
+  print(width = Inf)
+
+# ----------------------------------------------------------------
+# 8) Save outputs
+# ----------------------------------------------------------------
+
+# Full ranked table
+write_csv(
+  new_candidates_ranked,
+  "branch_guided_coexpression/tables/Candidate_ranked_branch_corrected.csv"
+)
+
+# Per-category subsets
+walk(
+  unique(new_candidates_ranked$annotation_category),
+  ~write_csv(
+    filter(new_candidates_ranked, annotation_category == .x),
+    file.path(
+      "branch_guided_coexpression/tables",
+      paste0("candidates_", str_replace_all(.x, " ", "_"), ".csv")
+    )
+  )
+)
+
+# Per-branch subsets — useful for wet lab follow-up
+walk(
+  c("Galanthamine", "Haemanthamine", "Precursor"),
+  ~write_csv(
+    filter(new_candidates_ranked, best_branch == .x) %>%
+      arrange(desc(final_priority), desc(best_branch_r)),
+    file.path(
+      "branch_guided_coexpression/tables",
+      paste0("candidates_best_branch_", .x, ".csv")
+    )
+  )
+)
+
+cat("\nFiles saved:\n")
+list.files("branch_guided_coexpression/tables", pattern = "candidates_") %>%
+  cat(sep = "\n")
+
+##
+# ----------------------------------------------------------------
+# Audit protein lengths BEFORE deciding thresholds
+# ----------------------------------------------------------------
+new_candidates_ranked %>%
+  group_by(annotation_category) %>%
+  summarise(
+    n_total     = n(),
+    n_no_length = sum(is.na(protein_length)),
+    n_under_100 = sum(protein_length < 100,  na.rm = TRUE),
+    n_under_200 = sum(protein_length < 200,  na.rm = TRUE),
+    n_under_300 = sum(protein_length < 300,  na.rm = TRUE),
+    n_under_400 = sum(protein_length < 400,  na.rm = TRUE),
+    median_len  = median(protein_length,     na.rm = TRUE),
+    min_len     = min(protein_length,        na.rm = TRUE),
+    max_len     = max(protein_length,        na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  print(width = Inf)
+
+# ----------------------------------------------------------------
+# Apply category-specific length thresholds
+# ----------------------------------------------------------------
+new_candidates_ranked <- new_candidates_ranked %>%
+  mutate(
+    length_threshold = case_when(
+      annotation_category == "biosynthetic enzyme"  ~ 250L,
+      annotation_category == "transporter"          ~ 300L,
+      annotation_category == "transcription factor" ~ 150L,
+      annotation_category == "regulatory"           ~ 150L,
+      annotation_category == "other annotated"      ~ 100L,
+      annotation_category == "no Pfam"              ~ 150L,
+      TRUE                                          ~ 100L
+    ),
+    passes_length = case_when(
+      is.na(protein_length)              ~ FALSE,
+      protein_length >= length_threshold ~ TRUE,
+      TRUE                               ~ FALSE
+    ),
+    length_flag = case_when(
+      is.na(protein_length) ~ "no sequence",
+      !passes_length        ~ paste0("too short (",
+                                     protein_length, " aa < ",
+                                     length_threshold, " threshold)"),
+      TRUE                  ~ "pass"
+    )
+  )
+
+# ----------------------------------------------------------------
+# Report what gets removed per category
+# ----------------------------------------------------------------
+cat("\nLength filter summary:\n")
+new_candidates_ranked %>%
+  count(annotation_category, passes_length) %>%
+  pivot_wider(names_from = passes_length,
+              values_from = n,
+              values_fill = 0) %>%
+  rename(passes = `TRUE`, removed = `FALSE`) %>%
+  mutate(pct_kept = round(100 * passes / (passes + removed), 1)) %>%
+  print()
+
+# ----------------------------------------------------------------
+# Split into passing and flagged
+# ----------------------------------------------------------------
+new_candidates_ranked_filtered <- new_candidates_ranked %>%
+  filter(passes_length)
+
+new_candidates_ranked_tooshort <- new_candidates_ranked %>%
+  filter(!passes_length)
+
+cat("\nTotal before filter:", nrow(new_candidates_ranked), "\n")
+cat("Passes length filter:", nrow(new_candidates_ranked_filtered), "\n")
+cat("Removed as too short:", nrow(new_candidates_ranked_tooshort), "\n")
+
+# ----------------------------------------------------------------
+# Save both — never silently discard
+# ----------------------------------------------------------------
+write_csv(
+  new_candidates_ranked_filtered,
+  "branch_guided_coexpression/tables/Candidate_ranked_length_filtered.csv"
+)
+
+write_csv(
+  new_candidates_ranked_tooshort,
+  "branch_guided_coexpression/tables/Candidate_ranked_tooshort_flagged.csv"
+)
+
+# ----------------------------------------------------------------
+# Save FASTAs for filtered candidates
+# ----------------------------------------------------------------
+
+# All candidates — peptide
+new_candidates_ranked_filtered %>%
+  filter(!is.na(peptide), peptide != ".") %>%
+  mutate(fasta_entry = paste0(
+    ">", gene_ID,
+    " module=", module,
+    " category=", annotation_category,
+    " best_branch=", best_branch,
+    " priority=", final_priority,
+    "\n", peptide
+  )) %>%
+  pull(fasta_entry) %>%
+  paste(collapse = "\n") %>%
+  writeLines("branch_guided_coexpression/tables/candidates_filtered_peptides.fasta")
+
+# All candidates — transcript
+new_candidates_ranked_filtered %>%
+  filter(!is.na(transcript), transcript != ".") %>%
+  mutate(fasta_entry = paste0(
+    ">", gene_ID,
+    " module=", module,
+    " category=", annotation_category,
+    " best_branch=", best_branch,
+    "\n", transcript
+  )) %>%
+  pull(fasta_entry) %>%
+  paste(collapse = "\n") %>%
+  writeLines("branch_guided_coexpression/tables/candidates_filtered_transcripts.fasta")
+
+# Per-category peptide FASTAs
+walk(
+  c("biosynthetic enzyme",
+    "transcription factor",
+    "transporter",
+    "regulatory"),
+  ~{
+    df <- new_candidates_ranked_filtered %>%
+      filter(annotation_category == .x,
+             !is.na(peptide), peptide != ".")
+    if (nrow(df) == 0) return(NULL)
+    df %>%
+      mutate(fasta_entry = paste0(
+        ">", gene_ID,
+        " module=", module,
+        " best_branch=", best_branch,
+        " priority=", final_priority,
+        " length=", protein_length,
+        "\n", peptide
+      )) %>%
+      pull(fasta_entry) %>%
+      paste(collapse = "\n") %>%
+      writeLines(file.path(
+        "branch_guided_coexpression/tables",
+        paste0("candidates_",
+               str_replace_all(.x, " ", "_"),
+               "_peptides.fasta")
+      ))
+    cat("Saved:", .x, "—", nrow(df), "sequences\n")
+  }
+)
+
+cat("\nDone. Files saved:\n")
+list.files("branch_guided_coexpression/tables",
+           pattern = "\\.fasta$|\\.csv$") %>%
+  cat(sep = "\n")
