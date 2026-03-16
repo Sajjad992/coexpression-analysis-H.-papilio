@@ -1,0 +1,468 @@
+# ================================================================
+# Metabolite-transcript correlation analysis
+# Branch-guided candidates vs absolute metabolite levels
+# ================================================================
+
+library(tidyverse)
+library(readxl)
+library(corrr)
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+
+set.seed(123)
+
+# ----------------------------------------------------------------
+# Output folders
+# ----------------------------------------------------------------
+out_metab <- "metabolite_correlation"
+dir.create(file.path(out_metab, "results"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_metab, "plots"),   recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_metab, "tables"),  recursive = TRUE, showWarnings = FALSE)
+
+# ================================================================
+# 1) Load and clean metabolite data
+# ================================================================
+metab_raw <- read_excel(
+  "metabolites/metabolitesabsolute.xlsx",
+  sheet = 1,
+  na = c("", "NA", "n/a", "N/A", "nd", "ND", "-")
+)
+
+# Drop the spurious ...2 column and Norbelladine (all NA)
+# Drop sparse metabolites (>75% missing): Ferulic acid, Dopamine, p-coumaric acid
+metab_clean <- metab_raw %>%
+  select(-any_of(c("...2", "Norbelladine",
+                   "Ferulic acid", "Dopamine", "p-coumaric acid"))) %>%
+  rename(sample = Tissue) %>%
+  mutate(
+    # Extract tissue name from sample ID (R_1 -> Root, BS_1 -> Basalplate etc.)
+    tissue = case_when(
+      str_starts(sample, "R_")   ~ "Root",
+      str_starts(sample, "BS_")  ~ "Basalplate",
+      str_starts(sample, "IB_")  ~ "Innerbulb",
+      str_starts(sample, "YL_")  ~ "Youngleaf",
+      str_starts(sample, "OL_")  ~ "Oldleaf",
+      str_starts(sample, "FS_")  ~ "Flowerstalk",
+      str_starts(sample, "P_")   ~ "Petal",
+      str_starts(sample, "PD_")  ~ "Peduncle",
+      str_starts(sample, "PI_")  ~ "Pistil",
+      TRUE ~ sample
+    )
+  )
+
+cat("Metabolite table after cleaning:", dim(metab_clean), "\n")
+cat("Tissues represented:\n")
+print(table(metab_clean$tissue))
+
+# ================================================================
+# 2) Compute derived metabolite variables
+# ================================================================
+metab_derived <- metab_clean %>%
+  mutate(
+    # Tier 1 ratios
+    Gal_Hae_ratio     = Galanthamine / Haemanthamine,
+    
+    # Tier 2 — total precursor amino acid pool
+    Total_AA          = `L-Tyrosine` + Phenylalanine,
+    Tyr_Phe_ratio     = `L-Tyrosine` / Phenylalanine,
+    
+    # Tier 1 — galanthamine branch: norgalanthamine as intermediate
+    Norgal_Gal_ratio  = Norgalanthamine / Galanthamine,
+    
+    # Tier 1 — haemanthamine branch proxy
+    Vit_Hae_ratio     = `Vittatine and/or crinine` / Haemanthamine,
+    
+    # Total alkaloid load
+    Total_alkaloid    = Galanthamine + Haemanthamine +
+      Norgalanthamine +
+      replace_na(`Vittatine and/or crinine`, 0)
+  )
+
+# Define which metabolite columns to use in correlation
+# Tier 1 (complete / biologically central)
+tier1_cols <- c(
+  "Galanthamine", "Haemanthamine",
+  "Gal_Hae_ratio", "Norgalanthamine",
+  "Vittatine and/or crinine",
+  "Total_alkaloid"
+)
+
+# Tier 2 (precursor pool)
+tier2_cols <- c(
+  "L-Tyrosine", "Phenylalanine",
+  "Total_AA", "Tyr_Phe_ratio"
+)
+
+# Tier 3 (use with caution — partial missingness)
+tier3_cols <- c(
+  "4-hydroxybenzaldehyde",
+  "4'-O-methylnorbelladine",
+  "Tyramine", "Vanillin"
+)
+
+all_metab_cols <- c(tier1_cols, tier2_cols, tier3_cols)
+
+cat("\nMetabolite columns for correlation:\n")
+print(all_metab_cols)
+
+# ================================================================
+# 3) Z-score metabolites (for plotting only)
+# ================================================================
+metab_z <- metab_derived %>%
+  mutate(across(all_of(all_metab_cols),
+                ~scale(.x)[,1],
+                .names = "z_{.col}"))
+
+# Save cleaned metabolite table
+write_csv(metab_derived,
+          file.path(out_metab, "tables", "metabolites_clean_with_derived.csv"))
+
+# ================================================================
+# 4) Prepare expression matrix for candidates
+# ================================================================
+
+# Get tissue-averaged z-scores for all ranked candidates
+candidate_gene_ids <- unique(new_candidates_ranked_filtered$gene_ID)
+
+cat("\nCandidates to correlate:", length(candidate_gene_ids), "\n")
+
+# Build wide expression matrix: genes x samples
+# Match sample naming to metabolite table
+expr_candidates <- Exp_table_long_averaged_z_cp %>%
+  filter(gene_ID %in% candidate_gene_ids) %>%
+  mutate(
+    tissue = gsub("_|\\s+", "", tissue),
+    tissue = case_when(
+      tissue == "Basalplate"  ~ "Basalplate",
+      tissue == "Innerbulb"   ~ "Innerbulb",
+      tissue == "Youngleaf"   ~ "Youngleaf",
+      tissue == "Oldleaf"     ~ "Oldleaf",
+      tissue == "Flowerstalk" ~ "Flowerstalk",
+      tissue == "Peduncle"    ~ "Peduncle",
+      TRUE ~ tissue
+    )
+  )
+
+# Average across replicates per tissue (expression is already averaged)
+# Join with metabolite replicates by tissue
+# This gives us 27 data points (9 tissues x 3 replicates)
+# by matching each replicate's tissue to the gene's tissue mean
+
+expr_for_join <- expr_candidates %>%
+  select(gene_ID, tissue, z.score.TPM)
+
+metab_for_join <- metab_derived %>%
+  select(sample, tissue, all_of(all_metab_cols))
+
+# Join on tissue — each gene tissue average matched to 3 metabolite replicates
+expr_metab_joined <- metab_for_join %>%
+  left_join(expr_for_join, by = "tissue", relationship = "many-to-many")
+
+cat("Joined table dimensions:", dim(expr_metab_joined), "\n")
+cat("Unique genes in joined table:", n_distinct(expr_metab_joined$gene_ID), "\n")
+
+# ================================================================
+# 5) Correlation — all candidates x all metabolites
+# ================================================================
+n_samples_corr <- n_distinct(metab_derived$sample)  # 27
+cat("\nCorrelation based on n =", n_samples_corr, "samples\n")
+
+# Function: correlate one gene against all metabolites
+correlate_gene_vs_metabolites <- function(gene, data, metab_cols) {
+  
+  gene_data <- data %>% filter(gene_ID == gene)
+  
+  if (nrow(gene_data) < 5) return(NULL)
+  
+  map_dfr(metab_cols, function(m) {
+    
+    df <- gene_data %>%
+      select(expr = z.score.TPM, metab = all_of(m)) %>%
+      filter(!is.na(metab), !is.na(expr))
+    
+    if (nrow(df) < 5) return(NULL)
+    
+    n  <- nrow(df)
+    
+    # Pearson
+    r_p  <- cor(df$expr, df$metab, method = "pearson")
+    t_p  <- r_p * sqrt((n - 2) / (1 - r_p^2))
+    p_p  <- 2 * pt(-abs(t_p), df = n - 2)
+    
+    # Spearman (robustness check)
+    r_s  <- cor(df$expr, df$metab, method = "spearman")
+    t_s  <- r_s * sqrt((n - 2) / (1 - r_s^2))
+    p_s  <- 2 * pt(-abs(t_s), df = n - 2)
+    
+    tibble(
+      gene_ID         = gene,
+      metabolite      = m,
+      n               = n,
+      r_pearson       = r_p,
+      p_pearson       = p_p,
+      r_spearman      = r_s,
+      p_spearman      = p_s
+    )
+  })
+}
+
+# Run for all candidates
+cat("\nRunning correlations...\n")
+
+cor_results_raw <- map_dfr(
+  candidate_gene_ids,
+  ~correlate_gene_vs_metabolites(.x, expr_metab_joined, all_metab_cols),
+  .progress = TRUE
+)
+
+# FDR correction per metabolite
+cor_results <- cor_results_raw %>%
+  group_by(metabolite) %>%
+  mutate(
+    FDR_pearson  = p.adjust(p_pearson,  method = "fdr"),
+    FDR_spearman = p.adjust(p_spearman, method = "fdr")
+  ) %>%
+  ungroup()
+
+# Assign metabolite tier
+cor_results <- cor_results %>%
+  mutate(
+    metab_tier = case_when(
+      metabolite %in% tier1_cols ~ "Tier1_primary",
+      metabolite %in% tier2_cols ~ "Tier2_precursor",
+      metabolite %in% tier3_cols ~ "Tier3_caution"
+    )
+  )
+
+write_csv(cor_results,
+          file.path(out_metab, "results", "all_candidate_metabolite_correlations.csv"))
+
+cat("\nTotal gene-metabolite pairs tested:", nrow(cor_results), "\n")
+
+# ================================================================
+# 6) Filter significant hits
+# ================================================================
+r_thresh   <- 0.7
+fdr_thresh <- 0.05
+
+cor_sig <- cor_results %>%
+  filter(
+    abs(r_pearson) >= r_thresh,
+    FDR_pearson    <  fdr_thresh
+  )
+
+cat("\nSignificant hits (|r| >=", r_thresh, ", FDR <", fdr_thresh, "):",
+    nrow(cor_sig), "\n")
+cat("Unique genes:", n_distinct(cor_sig$gene_ID), "\n")
+cat("Breakdown by metabolite:\n")
+print(count(cor_sig, metabolite, sort = TRUE))
+
+# ================================================================
+# 7) Join candidate metadata onto results
+# ================================================================
+candidate_meta <- new_candidates_ranked_filtered %>%
+  select(gene_ID, module, Module_class,
+         annotation_category, best_branch,
+         best_branch_r, final_priority,
+         Pfam_desc, EggNM.Description,
+         Gal_score, Hae_score, TotalAA_score, Bio_score,
+         mean_r_Galanthamine, mean_r_Haemanthamine, mean_r_Precursor)
+
+cor_sig_annot <- cor_sig %>%
+  left_join(candidate_meta, by = "gene_ID") %>%
+  arrange(metabolite, desc(abs(r_pearson)))
+
+write_csv(cor_sig_annot,
+          file.path(out_metab, "results", "significant_correlations_annotated.csv"))
+
+# ================================================================
+# 8) Split by annotation category
+# ================================================================
+categories <- unique(cor_sig_annot$annotation_category)
+
+walk(categories, ~{
+  df <- filter(cor_sig_annot, annotation_category == .x)
+  write_csv(
+    df,
+    file.path(out_metab, "tables",
+              paste0("sig_corr_", str_replace_all(.x, " ", "_"), ".csv"))
+  )
+  cat(.x, "—", n_distinct(df$gene_ID), "genes\n")
+})
+
+# ================================================================
+# 9) Plots
+# ================================================================
+
+# --- 9a) Overview: r distribution per metabolite tier ---
+p_rdist <- cor_results %>%
+  filter(metab_tier == "Tier1_primary") %>%
+  ggplot(aes(x = r_pearson, fill = metabolite)) +
+  geom_histogram(bins = 80, alpha = 0.7, position = "identity") +
+  geom_vline(xintercept = c(-r_thresh, r_thresh),
+             color = "red", linetype = "dashed") +
+  facet_wrap(~metabolite, scales = "free_y", ncol = 3) +
+  labs(
+    title = "Pearson r distribution — Tier 1 metabolites",
+    x = "Pearson r", y = "Count"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+ggsave(file.path(out_metab, "plots", "r_distribution_tier1.png"),
+       p_rdist, width = 14, height = 8, dpi = 300)
+
+# --- 9b) Heatmap: top genes x Tier 1 metabolites ---
+top_genes <- cor_sig_annot %>%
+  filter(metab_tier == "Tier1_primary") %>%
+  group_by(gene_ID) %>%
+  summarise(max_abs_r = max(abs(r_pearson)), .groups = "drop") %>%
+  slice_max(max_abs_r, n = 60) %>%
+  pull(gene_ID)
+
+heatmap_mat <- cor_results %>%
+  filter(gene_ID %in% top_genes,
+         metabolite %in% tier1_cols) %>%
+  select(gene_ID, metabolite, r_pearson) %>%
+  pivot_wider(names_from = metabolite, values_from = r_pearson) %>%
+  column_to_rownames("gene_ID")
+
+# Add significance asterisks
+sig_mat <- cor_results %>%
+  filter(gene_ID %in% top_genes,
+         metabolite %in% tier1_cols) %>%
+  select(gene_ID, metabolite, FDR_pearson) %>%
+  pivot_wider(names_from = metabolite, values_from = FDR_pearson) %>%
+  column_to_rownames("gene_ID")
+
+heatmap_long <- heatmap_mat %>%
+  rownames_to_column("gene_ID") %>%
+  pivot_longer(-gene_ID, names_to = "metabolite", values_to = "r") %>%
+  left_join(
+    sig_mat %>%
+      rownames_to_column("gene_ID") %>%
+      pivot_longer(-gene_ID, names_to = "metabolite", values_to = "FDR"),
+    by = c("gene_ID", "metabolite")
+  ) %>%
+  left_join(candidate_meta %>%
+              select(gene_ID, annotation_category, best_branch),
+            by = "gene_ID") %>%
+  mutate(
+    sig_label = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01  ~ "**",
+      FDR < 0.05  ~ "*",
+      TRUE        ~ ""
+    ),
+    metabolite = factor(metabolite, levels = tier1_cols)
+  )
+
+p_heat <- heatmap_long %>%
+  ggplot(aes(x = metabolite, y = gene_ID, fill = r)) +
+  geom_tile(color = "grey90") +
+  geom_text(aes(label = sig_label), size = 3, vjust = 0.8) +
+  scale_fill_gradient2(
+    low = "#053061", mid = "white", high = "#67001F",
+    midpoint = 0, limits = c(-1, 1),
+    name = "Pearson r"
+  ) +
+  facet_grid(annotation_category ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title = "Top 60 candidates — correlation with Tier 1 metabolites",
+    x = "Metabolite", y = "Gene"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    strip.text.y = element_text(face = "bold", size = 9)
+  )
+
+ggsave(file.path(out_metab, "plots", "heatmap_top60_tier1_metabolites.png"),
+       p_heat, width = 12, height = 16, dpi = 300, bg = "white")
+
+ggsave(file.path(out_metab, "plots", "heatmap_top60_tier1_metabolites.svg"),
+       p_heat, width = 12, height = 16, bg = "white")
+
+# --- 9c) Scatter: top hits per metabolite ---
+plot_top_scatter <- function(metab_name, top_n = 6) {
+  
+  top_g <- cor_sig_annot %>%
+    filter(metabolite == metab_name) %>%
+    slice_max(abs(r_pearson), n = top_n) %>%
+    pull(gene_ID)
+  
+  if (length(top_g) == 0) return(NULL)
+  
+  plot_data <- expr_metab_joined %>%
+    filter(gene_ID %in% top_g) %>%
+    select(sample, tissue, gene_ID,
+           z.score.TPM, metab_val = all_of(metab_name)) %>%
+    filter(!is.na(metab_val)) %>%
+    left_join(cor_sig_annot %>%
+                filter(metabolite == metab_name) %>%
+                select(gene_ID, r_pearson, FDR_pearson,
+                       annotation_category),
+              by = "gene_ID")
+  
+  ggplot(plot_data,
+         aes(x = metab_val, y = z.score.TPM, color = tissue)) +
+    geom_point(size = 2.5, alpha = 0.8) +
+    geom_smooth(method = "lm", se = TRUE,
+                color = "grey30", linewidth = 0.7) +
+    geom_label(
+      data = plot_data %>%
+        distinct(gene_ID, r_pearson, FDR_pearson, annotation_category),
+      aes(label = paste0("r=", round(r_pearson, 2),
+                         "\nFDR=", signif(FDR_pearson, 2))),
+      x = -Inf, y = Inf, hjust = -0.1, vjust = 1.2,
+      size = 3, inherit.aes = FALSE, color = "black"
+    ) +
+    facet_wrap(~gene_ID, scales = "free", ncol = 3) +
+    labs(
+      title = paste("Top hits —", metab_name),
+      x = paste(metab_name, "(ng/ml)"),
+      y = "z-scored TPM",
+      color = "Tissue"
+    ) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "bottom")
+}
+
+# Save scatter plots for Tier 1 metabolites
+walk(tier1_cols, ~{
+  p <- plot_top_scatter(.x)
+  if (!is.null(p)) {
+    fname <- str_replace_all(.x, "[^a-zA-Z0-9]", "_")
+    ggsave(
+      file.path(out_metab, "plots",
+                paste0("scatter_top_hits_", fname, ".png")),
+      p, width = 14, height = 10, dpi = 300, bg = "white"
+    )
+  }
+})
+
+# ================================================================
+# 10) Summary table
+# ================================================================
+summary_table <- cor_sig_annot %>%
+  group_by(annotation_category, best_branch, metabolite) %>%
+  summarise(
+    n_genes      = n_distinct(gene_ID),
+    mean_r       = round(mean(r_pearson), 3),
+    max_r        = round(max(r_pearson),  3),
+    min_r        = round(min(r_pearson),  3),
+    .groups = "drop"
+  ) %>%
+  arrange(annotation_category, best_branch, desc(abs(mean_r)))
+
+write_csv(summary_table,
+          file.path(out_metab, "tables", "correlation_summary_by_category_branch.csv"))
+
+print(summary_table, n = 50)
+
+cat("\n✓ All outputs saved under:", out_metab, "\n")
+cat("  results/ — full correlation tables\n")
+cat("  tables/  — per-category subsets + summary\n")
+cat("  plots/   — heatmap + distributions + scatters\n")
