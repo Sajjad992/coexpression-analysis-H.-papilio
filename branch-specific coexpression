@@ -1,0 +1,672 @@
+# ============================================================
+# 🧬 Branch-aware Gene Co-expression Network Construction
+# Metabolite-guided tissue classes + branch-specific candidates
+# ============================================================
+
+# -------------------------------
+# 0️⃣ Setup
+# -------------------------------
+source("scripts/FUNCTIONS.R")
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(igraph)
+  library(furrr)
+  library(ggraph)
+  library(tidygraph)
+  library(patchwork)
+  library(reshape2)
+  library(readxl)
+})
+
+set.seed(123)
+
+# -------------------------------
+# Parameters
+# -------------------------------
+r_cutoff <- 0.80
+fdr_cutoff <- 0.01
+minGenes <- 5
+
+# -------------------------------
+# Output folders
+# -------------------------------
+out_root   <- "branch_guided_coexpression"
+out_res    <- file.path(out_root, "results")
+out_plot   <- file.path(out_root, "plots")
+out_tables <- file.path(out_root, "tables")
+
+dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_res, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_plot, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_tables, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------------
+# 1️⃣ Load expression and metadata
+# -------------------------------
+Exp_table_long_averaged_z_cp <- read_delim(
+  "results/Exp_table_long_averaged_z_highVar_20pct.tsv",
+  delim = "\t",
+  show_col_types = FALSE
+)
+
+cat("Unique genes in expression table:", length(unique(Exp_table_long_averaged_z_cp$gene_ID)), "\n")
+
+metadata <- read_delim(
+  "metadata.txt",
+  col_names = c("replicateName", "tissue", rep(".", 3))
+) %>%
+  select(replicateName, tissue) %>%
+  mutate(
+    tissue = gsub("_|\\s+", "", tissue),
+    TissueOrdered = factor(
+      tissue,
+      levels = c("Root", "Basalplate", "Innerbulb",
+                 "Youngleaf", "Oldleaf", "Flowerstalk",
+                 "Petal", "Peduncle", "Pistil")
+    ),
+    TissueClass = case_when(
+      tissue %in% c("Petal", "Pistil") ~ "High Gal",
+      tissue %in% c("Basalplate") ~ "High Hae",
+      tissue %in% c("Peduncle") ~ "High Total AA",
+      tissue %in% c("Innerbulb") ~ "Biosynth Active",
+      tissue %in% c("Root", "Youngleaf", "Oldleaf", "Flowerstalk") ~ "Other",
+      TRUE ~ "Other"
+    )
+  )
+
+class_colors <- c(
+  "High Gal" = "#3a7d3a",
+  "High Hae" = "#000000",
+  "High Total AA" = "brown",
+  "Biosynth Active" = "#4C78A8",
+  "Other" = "purple"
+)
+
+write_tsv(metadata, file.path(out_tables, "metadata_with_tissue_classes.tsv"))
+metadata
+# -------------------------------
+# 2️⃣ Sample column detection
+# -------------------------------
+sample_col <- if ("SampleName" %in% colnames(Exp_table_long_averaged_z_cp)) "SampleName" else "tissue"
+
+# clean sample names in expression table for consistency
+Exp_table_long_averaged_z_cp <- Exp_table_long_averaged_z_cp %>%
+  mutate(!!sample_col := gsub("_|\\s+", "", !!sym(sample_col)))
+
+# -------------------------------
+# 3️⃣ Load curated bait table with Branch labels
+# IMPORTANT: this file should contain at least:
+# gene_ID, Gene_name, Branch
+# Branch values expected: Galanthamine, Haemanthamine, Precursor
+# -------------------------------
+bait_info <- read_delim(
+  "results/baits_branch_annotated.tsv",
+  delim = "\t",
+  show_col_types = FALSE
+) %>%
+  distinct(gene_ID, Gene_name, Branch)
+
+cat("Baits loaded:", nrow(bait_info), "\n")
+print(table(bait_info$Branch))
+
+write_tsv(bait_info, file.path(out_tables, "bait_info_loaded.tsv"))
+
+# -------------------------------
+# 4️⃣ Build expression matrix (genes x tissues)
+# -------------------------------
+z_score_wide_cp <- Exp_table_long_averaged_z_cp %>%
+  select(gene_ID, tissue = !!sym(sample_col), z.score.TPM) %>%
+  pivot_wider(names_from = tissue, values_from = z.score.TPM) %>%
+  as.data.frame()
+
+n_samples <- ncol(z_score_wide_cp) - 1
+cat("Number of samples/tissues used for correlation:", n_samples, "\n")
+
+# -------------------------------
+# 5️⃣ Helper: correlation against bait set
+# -------------------------------
+correlate_against_bait_set <- function(bait_ids, bait_label, expr_wide, r_cutoff = 0.9, fdr_cutoff = 0.01) {
+  
+  bait_ids <- intersect(bait_ids, expr_wide$gene_ID)
+  
+  if (length(bait_ids) == 0) {
+    warning("No bait IDs found in expression matrix for: ", bait_label)
+    return(NULL)
+  }
+  
+  res <- lapply(bait_ids, function(x) {
+    bait_row <- expr_wide %>% filter(gene_ID == x)
+    other_rows <- expr_wide %>% filter(gene_ID != x)
+    
+    dBait <- t(as.matrix(bait_row[, -1, drop = FALSE]))
+    dOthers <- t(as.matrix(other_rows[, -1, drop = FALSE]))
+    
+    data.frame(correlation = cor(dBait, dOthers) %>% t) %>%
+      mutate(
+        Gene1 = x,
+        Gene2 = other_rows$gene_ID,
+        BaitSet = bait_label,
+        r2 = correlation^2,
+        t_vals = ifelse(abs(correlation) == 1, Inf,
+                        correlation * sqrt(n_samples - 2) / sqrt(1 - r2)),
+        p_vals = ifelse(abs(correlation) == 1, 0,
+                        2 * pt(-abs(t_vals), df = n_samples - 2))
+      )
+  }) %>% list_rbind()
+  
+  res <- res %>%
+    mutate(
+      fdr_vals = p.adjust(p_vals, method = "fdr"),
+      significant = fdr_vals < fdr_cutoff
+    )
+  
+  return(res)
+}
+
+# -------------------------------
+# 6️⃣ Split bait sets by branch
+# -------------------------------
+gal_baits <- bait_info %>%
+  filter(Branch == "Galanthamine") %>%
+  pull(gene_ID) %>%
+  unique()
+
+hae_baits <- bait_info %>%
+  filter(Branch == "Haemanthamine") %>%
+  pull(gene_ID) %>%
+  unique()
+
+prec_baits <- bait_info %>%
+  filter(Branch == "Precursor") %>%
+  pull(gene_ID) %>%
+  unique()
+
+# -------------------------------
+# 7️⃣ Branch-specific correlations
+# -------------------------------
+cor_gal  <- correlate_against_bait_set(gal_baits,  "Galanthamine", z_score_wide_cp, r_cutoff, fdr_cutoff)
+cor_hae  <- correlate_against_bait_set(hae_baits,  "Haemanthamine", z_score_wide_cp, r_cutoff, fdr_cutoff)
+cor_prec <- correlate_against_bait_set(prec_baits, "Precursor", z_score_wide_cp, r_cutoff, fdr_cutoff)
+
+cor_branch_all <- bind_rows(cor_gal, cor_hae, cor_prec)
+
+write_tsv(cor_branch_all, file.path(out_res, "branch_specific_bait_vs_all_correlations.tsv"))
+
+# -------------------------------
+# 8️⃣ Correlation distribution plot
+# -------------------------------
+p_cor_hist <- cor_branch_all %>%
+  ggplot(aes(x = correlation, fill = BaitSet)) +
+  geom_histogram(bins = 100, alpha = 0.7, position = "identity") +
+  geom_vline(xintercept = r_cutoff, color = "red", linewidth = 0.8) +
+  facet_wrap(~ BaitSet, scales = "free_y") +
+  labs(
+    title = "Branch-specific bait-vs-all correlation distributions",
+    x = "Correlation (r)",
+    y = "Count"
+  ) +
+  theme_classic(base_size = 14)
+
+ggsave(
+  file.path(out_plot, "branch_specific_bait_correlation_distributions.png"),
+  p_cor_hist, width = 10, height = 4.5, dpi = 300
+)
+
+# -------------------------------
+# 9️⃣ Summarize gene-level branch scores
+# -------------------------------
+gene_branch_scores <- cor_branch_all %>%
+  filter(significant, correlation >= r_cutoff) %>%
+  group_by(BaitSet, Gene2) %>%
+  summarise(
+    mean_r = mean(correlation, na.rm = TRUE),
+    max_r = max(correlation, na.rm = TRUE),
+    n_baits = n_distinct(Gene1),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = BaitSet,
+    values_from = c(mean_r, max_r, n_baits),
+    values_fill = 0
+  ) %>%
+  rename(gene_ID = Gene2)
+
+write_tsv(gene_branch_scores, file.path(out_tables, "gene_branch_scores.tsv"))
+
+# -------------------------------
+# 🔟 Keep genes strongly correlated with any bait set
+# -------------------------------
+genes_to_keep <- cor_branch_all %>%
+  filter(significant, correlation >= r_cutoff) %>%
+  pull(Gene2) %>%
+  unique()
+
+genes_to_keep <- union(genes_to_keep, unique(bait_info$gene_ID))
+
+cat("Genes retained for branch-guided network:", length(genes_to_keep), "\n")
+
+write_tsv(
+  tibble(gene_ID = genes_to_keep),
+  file.path(out_tables, "genes_retained_for_branch_guided_network.tsv")
+)
+
+# -------------------------------
+# 11️⃣ Build filtered expression matrix
+# -------------------------------
+Expr_filtered_long <- Exp_table_long_averaged_z_cp %>%
+  filter(gene_ID %in% genes_to_keep)
+
+Expr_filtered_wide <- Expr_filtered_long %>%
+  select(gene_ID, !!sym(sample_col), z.score.TPM) %>%
+  pivot_wider(names_from = !!sym(sample_col), values_from = z.score.TPM) %>%
+  column_to_rownames("gene_ID")
+
+if (nrow(Expr_filtered_wide) < 2) {
+  stop("Not enough genes retained to compute all-vs-all correlations.")
+}
+
+# -------------------------------
+# 12️⃣ All-vs-all correlation matrix
+# -------------------------------
+cor_mat <- cor(
+  t(Expr_filtered_wide),
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+cor_long <- as.data.frame(cor_mat) %>%
+  tibble::rownames_to_column("Gene1") %>%
+  pivot_longer(-Gene1, names_to = "Gene2", values_to = "correlation") %>%
+  filter(Gene1 != Gene2) %>%
+  mutate(
+    t_stat = ifelse(abs(correlation) == 1, Inf,
+                    correlation * sqrt((n_samples - 2) / (1 - correlation^2))),
+    p_value = ifelse(abs(correlation) == 1, 0,
+                     2 * pt(-abs(t_stat), df = n_samples - 2)),
+    FDR = p.adjust(p_value, method = "fdr"),
+    significant = FDR < fdr_cutoff
+  )
+
+cor_long_filtered_unique <- cor_long %>%
+  filter(significant, abs(correlation) >= r_cutoff) %>%
+  mutate(pair = paste0(pmin(Gene1, Gene2), "_", pmax(Gene1, Gene2))) %>%
+  distinct(pair, .keep_all = TRUE) %>%
+  select(-pair)
+
+write_tsv(
+  cor_long_filtered_unique,
+  file.path(out_res, "branch_guided_all_vs_all_correlations_filtered.tsv")
+)
+
+# -------------------------------
+# 13️⃣ Build network
+# -------------------------------
+edge_table <- cor_long_filtered_unique %>%
+  rename(from = Gene1, to = Gene2, weight = correlation) %>%
+  select(from, to, weight, p_value, FDR)
+
+node_table <- tibble(gene_ID = unique(c(edge_table$from, edge_table$to)))
+
+my_network <- graph_from_data_frame(
+  edge_table,
+  vertices = node_table,
+  directed = FALSE
+)
+
+cat("Network built:", vcount(my_network), "nodes,", ecount(my_network), "edges\n")
+
+saveRDS(my_network, file = file.path(out_res, "branch_guided_network.rds"))
+write_tsv(edge_table, file.path(out_res, "branch_guided_network_edges.tsv"))
+
+# -------------------------------
+# 14️⃣ Leiden modules
+# -------------------------------
+if (!exists("optimize_resolution")) {
+  warning("optimize_resolution() not found. Using resolution = 1.")
+  resolution <- 1
+} else {
+  future::plan(multisession, workers = 1)
+  
+  res_seq <- seq(0.25, 5, by = 0.25)
+  opt_res_df <- future_map_dfr(
+    res_seq,
+    ~{
+      res_out <- optimize_resolution(
+        network = my_network,
+        resolution = .x,
+        minGenes = minGenes
+      )
+      data.frame(
+        resolution = .x,
+        num_module = as.numeric(res_out[1]),
+        num_contained_gene = as.numeric(res_out[2])
+      )
+    },
+    .options = furrr_options(seed = TRUE)
+  )
+  
+  write_tsv(opt_res_df, file.path(out_tables, "leiden_resolution_scan.tsv"))
+  
+  best_row <- opt_res_df %>%
+    filter(num_contained_gene == max(num_contained_gene, na.rm = TRUE)) %>%
+    slice_tail(n = 1)
+  
+  resolution <- best_row$resolution
+}
+
+cat("Selected Leiden resolution:", resolution, "\n")
+
+modules_ <- cluster_leiden(
+  my_network,
+  resolution_parameter = resolution,
+  objective_function = "modularity"
+)
+
+my_network_modules <- tibble(
+  gene_ID = names(membership(modules_)),
+  module = as.integer(membership(modules_))
+) %>%
+  inner_join(node_table, by = "gene_ID") %>%
+  group_by(module) %>%
+  filter(n() >= minGenes) %>%
+  ungroup()
+
+write_tsv(
+  my_network_modules,
+  file.path(out_res, "branch_guided_network_modules.tsv")
+)
+
+cat("Modules detected after filtering:", n_distinct(my_network_modules$module), "\n")
+
+# -------------------------------
+# 15️⃣ Module expression summary by tissue
+# -------------------------------
+expr_for_modules <- Exp_table_long_averaged_z_cp %>%
+  inner_join(my_network_modules, by = "gene_ID") %>%
+  mutate(!!sample_col := gsub("_|\\s+", "", !!sym(sample_col)))
+
+modules_mean_z <- expr_for_modules %>%
+  group_by(module, !!sym(sample_col)) %>%
+  summarise(mean.z = mean(z.score.TPM, na.rm = TRUE), .groups = "drop") %>%
+  rename(tissue = !!sym(sample_col))
+
+genes_per_module <- expr_for_modules %>%
+  group_by(module) %>%
+  summarise(n = n_distinct(gene_ID), .groups = "drop")
+
+heatmap_data <- modules_mean_z %>%
+  left_join(metadata %>% distinct(tissue, TissueOrdered, TissueClass), by = "tissue") %>%
+  full_join(genes_per_module, by = "module")
+
+# -------------------------------
+# 16️⃣ Module class scoring
+# -------------------------------
+module_class_scores <- heatmap_data %>%
+  group_by(module, TissueClass) %>%
+  summarise(mean_class_z = mean(mean.z, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = TissueClass, values_from = mean_class_z, values_fill = 0) %>%
+  mutate(
+    Gal_score = `High Gal` - pmax(`High Hae`, Other, na.rm = TRUE),
+    Hae_score = `High Hae` - pmax(`High Gal`, Other, na.rm = TRUE),
+    TotalAA_score = `High Total AA`,
+    Bio_score = `Biosynth Active`,
+    Module_class = case_when(
+      Gal_score >= 0.5 & `High Gal` > `High Hae` ~ "Galanthamine-like",
+      Hae_score >= 0.5 & `High Hae` > `High Gal` ~ "Haemanthamine-like",
+      TotalAA_score >= 0.5 ~ "High Total AA / shared",
+      Bio_score >= 0.5 ~ "Biosynthetically active",
+      TRUE ~ "Other"
+    )
+  )
+
+write_tsv(module_class_scores, file.path(out_tables, "module_class_scores.tsv"))
+module_class_scores %>%
+  select(module, `High Gal`, `High Hae`, `High Total AA`, `Biosynth Active`,
+         Gal_score, Hae_score, TotalAA_score, Bio_score, Module_class) %>%
+  arrange(module)
+
+# -------------------------------
+# 17️⃣ Annotate modules with class
+# -------------------------------
+my_network_modules_annotated <- my_network_modules %>%
+  left_join(
+    module_class_scores %>%
+      select(module, Module_class, Gal_score, Hae_score, TotalAA_score, Bio_score),
+    by = "module"
+  )
+
+write_tsv(
+  my_network_modules_annotated,
+  file.path(out_res, "branch_guided_network_modules_annotated.tsv")
+)
+
+# -------------------------------
+# 18️⃣ Reorder module heatmap by module class
+# -------------------------------
+heatmap_data <- heatmap_data %>%
+  left_join(module_class_scores %>% select(module, Module_class), by = "module") %>%
+  mutate(
+    Module_class = factor(
+      Module_class,
+      levels = c("Galanthamine-like",
+                 "Haemanthamine-like",
+                 "High Total AA / shared",
+                 "Biosynthetically active",
+                 "Other")
+    )
+  ) %>%
+  arrange(Module_class, desc(n)) %>%
+  mutate(ordered_modules = factor(module, levels = unique(module)))
+
+module_heatmap <- heatmap_data %>%
+  ggplot(aes(x = TissueOrdered, y = ordered_modules)) +
+  geom_tile(aes(fill = mean.z), color = "grey80") +
+  scale_fill_gradient2(
+    mid = "white", high = "#67001F", low = "#053061",
+    breaks = c(-1.5, 0, 1.5), labels = c("< -1.5", "0", "> 1.5")
+  ) +
+  labs(
+    x = "Tissue",
+    y = "Module",
+    fill = "Mean z-score",
+    caption = paste0("r ≥ ", r_cutoff, ", FDR < ", fdr_cutoff, ", resolution = ", resolution)
+  ) +
+  heatmap_theme +
+  theme(
+    axis.text.x = element_text(angle = -45, hjust = 0, vjust = 1)
+  )
+
+module_heatmap_nGenes <- heatmap_data %>%
+  select(ordered_modules, n) %>%
+  distinct() %>%
+  ggplot(aes(y = ordered_modules, x = "", label = n)) +
+  geom_tile(fill = "white", color = "white") +
+  geom_text() +
+  scale_x_discrete(position = "top") +
+  labs(x = "Genes\nin\nmodule") +
+  annotation_theme +
+  theme(
+    axis.title.x.top = element_text(hjust = 1, vjust = 0.5)
+  )
+
+p_mod <- wrap_plots(module_heatmap, module_heatmap_nGenes, ncol = 2, widths = c(2, 0.12))
+
+ggsave(
+  file.path(out_plot, "branch_guided_module_expression_heatmap.png"),
+  p_mod, width = 12, height = 9, dpi = 1200, bg = "white"
+)
+
+ggsave(
+  file.path(out_plot, "branch_guided_module_expression_heatmap.svg"),
+  p_mod, width = 12, height = 9, bg = "white"
+)
+
+# -------------------------------
+# 19️⃣ Branch-aware candidate table
+# -------------------------------
+candidate_table <- my_network_modules_annotated %>%
+  left_join(gene_branch_scores, by = "gene_ID") %>%
+  left_join(
+    bait_info %>% select(gene_ID, Gene_name, Branch),
+    by = "gene_ID"
+  )
+
+write_tsv(candidate_table, file.path(out_tables, "branch_guided_candidate_table_all.tsv"))
+
+# -------------------------------
+# 20️⃣ Candidate subsets
+# -------------------------------
+gal_candidates <- candidate_table %>%
+  filter(
+    Module_class %in% c("Galanthamine-like", "High Total AA / shared"),
+    mean_r_Galanthamine > mean_r_Haemanthamine
+  ) %>%
+  arrange(desc(mean_r_Galanthamine), desc(Gal_score), desc(TotalAA_score))
+
+hae_candidates <- candidate_table %>%
+  filter(
+    Module_class %in% c("Haemanthamine-like", "High Total AA / shared"),
+    mean_r_Haemanthamine > mean_r_Galanthamine
+  ) %>%
+  arrange(desc(mean_r_Haemanthamine), desc(Hae_score), desc(TotalAA_score))
+
+shared_candidates <- candidate_table %>%
+  filter(Module_class == "High Total AA / shared") %>%
+  arrange(desc(TotalAA_score), desc(mean_r_Galanthamine + mean_r_Haemanthamine))
+
+bioactive_candidates <- candidate_table %>%
+  filter(Module_class == "Biosynthetically active") %>%
+  arrange(desc(Bio_score), desc(mean_r_Precursor))
+
+write_tsv(gal_candidates,      file.path(out_tables, "candidates_galanthamine_like.tsv"))
+write_tsv(hae_candidates,      file.path(out_tables, "candidates_haemanthamine_like.tsv"))
+write_tsv(shared_candidates,   file.path(out_tables, "candidates_shared_high_total_AA.tsv"))
+write_tsv(bioactive_candidates,file.path(out_tables, "candidates_biosynthetically_active.tsv"))
+
+# -------------------------------
+# 21️⃣ Bait membership across modules
+# -------------------------------
+bait_module_table <- bait_info %>%
+  left_join(my_network_modules_annotated, by = "gene_ID") %>%
+  mutate(
+    Status = ifelse(is.na(module), "Unclustered", "Clustered"),
+    module = ifelse(is.na(module), "Unclustered", as.character(module)),
+    Module_class = ifelse(is.na(Module_class), "Unclustered", Module_class),
+    module = factor(module, levels = c(sort(unique(as.character(my_network_modules$module))), "Unclustered"))
+  )
+
+write_tsv(
+  bait_module_table,
+  file.path(out_tables, "bait_module_membership_branch_guided.tsv")
+)
+
+p_baits <- ggplot(
+  bait_module_table,
+  aes(x = module, y = Gene_name, fill = Status)
+) +
+  geom_tile(color = "grey85", linewidth = 0.3) +
+  scale_fill_manual(
+    values = c("Clustered" = "#1f78b4", "Unclustered" = "#e31a1c")
+  ) +
+  facet_grid(Branch ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    x = "Co-expression Module",
+    y = "Bait Gene",
+    fill = "Module Membership",
+    title = "Branch-aware bait gene module assignment"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    strip.text.y = element_text(face = "bold", size = 11),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave(
+  file.path(out_plot, "branch_aware_bait_module_assignment.png"),
+  p_baits, width = 8, height = 10, dpi = 300
+)
+
+ggsave(
+  file.path(out_plot, "branch_aware_bait_module_assignment.pdf"),
+  p_baits, width = 8, height = 10
+)
+
+# -------------------------------
+# 22️⃣ Final summary
+# -------------------------------
+cat("\nFinal branch-guided network summary:\n")
+cat("  Nodes:", vcount(my_network), "\n")
+cat("  Edges:", ecount(my_network), "\n")
+cat("  Modules:", n_distinct(my_network_modules$module), "\n")
+cat("  Gal candidates:", nrow(gal_candidates), "\n")
+cat("  Hae candidates:", nrow(hae_candidates), "\n")
+cat("  Shared candidates:", nrow(shared_candidates), "\n")
+cat("  Biosynthetically active candidates:", nrow(bioactive_candidates), "\n")
+
+cat("\nAll outputs saved under:\n")
+cat("  ", out_root, "\n")
+getwd()
+ls()
+list.files("branch_guided_coexpression")
+list.files("branch_guided_coexpression/results")
+list.files("branch_guided_coexpression/plots")
+list.files("branch_guided_coexpression/tables")
+
+gal_modules <- c(2,4)
+
+gal_branch_genes <- my_network_modules_annotated %>%
+  filter(module %in% gal_modules)
+
+nrow(gal_branch_genes)
+gal_modules <- c(2,4)
+
+gal_module_genes <- my_network_modules_annotated %>%
+  filter(module %in% gal_modules)
+
+gal_scores <- cor_long %>%
+  filter(Gene2 %in% bait_galanthamine) %>%
+  group_by(Gene1) %>%
+  summarise(
+    mean_r_gal = mean(correlation, na.rm = TRUE),
+    max_r_gal  = max(correlation, na.rm = TRUE),
+    n_baits    = n()
+  )
+gal_ranked <- gal_module_genes %>%
+  left_join(gal_scores, by = c("gene_ID" = "Gene1")) %>%
+  arrange(desc(mean_r_gal), desc(max_r_gal))
+head(gal_ranked, 30)
+sum(is.na(gal_ranked$mean_r_gal))
+nrow(gal_ranked)
+gal_ranked %>%
+  filter(!is.na(mean_r_gal)) %>%
+  nrow()
+head(gal_module_genes$gene_ID)
+head(gal_scores$Gene1)
+gal_scores <- cor_branch_all %>%
+  filter(
+    BaitSet == "Galanthamine",
+    significant,
+    correlation > 0
+  ) %>%
+  group_by(Gene2) %>%
+  summarise(
+    mean_r_gal = mean(correlation, na.rm = TRUE),
+    max_r_gal  = max(correlation, na.rm = TRUE),
+    n_gal_hits = n_distinct(Gene1),
+    .groups = "drop"
+  ) %>%
+  rename(gene_ID = Gene2)
+gal_ranked <- gal_module_genes %>%
+  left_join(gal_scores, by = "gene_ID") %>%
+  mutate(
+    mean_r_gal = replace_na(mean_r_gal, 0),
+    max_r_gal  = replace_na(max_r_gal, 0),
+    n_gal_hits = replace_na(n_gal_hits, 0)
+  ) %>%
+  arrange(desc(n_gal_hits), desc(max_r_gal), desc(mean_r_gal))
+gal_ranked
+
